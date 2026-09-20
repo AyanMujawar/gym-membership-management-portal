@@ -1,0 +1,39 @@
+---
+- name: Deploy Gym Membership Portal to the EC2 instance
+  hosts: web
+  become: true
+
+  vars:
+    repo_url: "https://github.com/AyanMujawar/gym-membership-management-portal.git"
+    app_dir: /home/ubuntu/gym-membership-management-portal
+
+  tasks:
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+
+    - name: Install Docker, the Compose plugin, and git
+      apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - git
+        state: present
+
+    - name: Add the ubuntu user to the docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Clone (or update) the project repository from GitHub
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: main
+        force: yes
+
+    - name: Build and start all containers with Docker Compose
+      command: docker compose up --build -d
+      args:
+        chdir: "{{ app_dir }}"

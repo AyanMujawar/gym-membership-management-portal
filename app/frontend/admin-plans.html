@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+    <title>Plans - FitZone Admin</title>
+</head>
+<body>
+    <nav class="navbar">
+        <a class="brand" href="admin.html">🏋️ Fit<span>Zone</span> Admin</a>
+        <div id="navLinks"></div>
+    </nav>
+
+    <h1 class="page-title">Membership Plans</h1>
+    <div class="toolbar">
+        <button class="btn" id="addBtn">+ Add Plan</button>
+    </div>
+    <div class="form-container" id="planFormCard" style="display:none; max-width: 600px;">
+        <h2 id="formTitle">Add Plan</h2>
+        <form id="planForm">
+            <label>Name</label>
+            <input type="text" id="name" required>
+            <label>Duration (days)</label>
+            <input type="number" id="duration" min="1" required>
+            <label>Price (₹)</label>
+            <input type="number" id="price" min="0" step="0.01" required>
+            <label>Description</label>
+            <input type="text" id="description">
+            <button type="submit" class="btn">Save</button>
+            <button type="button" class="btn btn-secondary" id="cancelBtn">Cancel</button>
+        </form>
+        <p class="message" id="message"></p>
+    </div>
+    <div class="list-card">
+        <div id="planTable"></div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/admin-plans.js"></script>
+</body>
+</html>

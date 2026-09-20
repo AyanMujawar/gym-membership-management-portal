@@ -1,0 +1,12 @@
+*.pem
+*.tfstate
+*.tfstate.backup
+.terraform/
+terraform.tfvars
+tfplan
+__pycache__/
+*.pyc
+uploads/
+.env
+docker_up.log
+.claude/

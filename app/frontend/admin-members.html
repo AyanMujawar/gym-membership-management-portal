@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+    <title>Members - FitZone Admin</title>
+</head>
+<body>
+    <nav class="navbar">
+        <a class="brand" href="admin.html">🏋️ Fit<span>Zone</span> Admin</a>
+        <div id="navLinks"></div>
+    </nav>
+
+    <h1 class="page-title">Members</h1>
+    <div class="toolbar">
+        <input type="text" id="search" placeholder="Search by name or email...">
+        <button class="btn" id="addBtn">+ Add Member</button>
+    </div>
+    <div class="form-container" id="memberFormCard" style="display:none; max-width: 600px;">
+        <h2 id="formTitle">Add Member</h2>
+        <form id="memberForm">
+            <label>Name</label>
+            <input type="text" id="name" required>
+            <label>Email</label>
+            <input type="email" id="email" required>
+            <label id="passwordLabel">Password (min 6 characters)</label>
+            <input type="password" id="password" minlength="6">
+            <label>Phone</label>
+            <input type="text" id="phone">
+            <label>Address</label>
+            <input type="text" id="address">
+            <button type="submit" class="btn">Save</button>
+            <button type="button" class="btn btn-secondary" id="cancelBtn">Cancel</button>
+        </form>
+        <p class="message" id="message"></p>
+    </div>
+    <div class="list-card">
+        <div id="memberTable"></div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/admin-members.js"></script>
+</body>
+</html>

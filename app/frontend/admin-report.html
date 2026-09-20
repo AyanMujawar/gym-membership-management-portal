@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+    <title>Report - FitZone Admin</title>
+</head>
+<body>
+    <nav class="navbar">
+        <a class="brand" href="admin.html">🏋️ Fit<span>Zone</span> Admin</a>
+        <div id="navLinks"></div>
+    </nav>
+
+    <h1 class="page-title">Gym Report</h1>
+    <div class="toolbar no-print"><button class="btn" onclick="window.print()">Print / Save as PDF</button></div>
+    <p class="empty-state" id="generatedAt"></p>
+    <div class="stat-grid" id="stats"></div>
+    <br>
+    <div class="list-card report-section"><h3>Revenue by Month</h3><div id="revenueTable"></div></div>
+    <div class="list-card report-section"><h3>Plan Popularity</h3><div id="planTable"></div></div>
+    <div class="list-card report-section"><h3>Expiring in the Next 14 Days</h3><div id="expiringTable"></div></div>
+    <div class="list-card report-section"><h3>All Members</h3><div id="memberTable"></div></div>
+
+    <script src="js/api.js"></script>
+    <script src="js/admin-report.js"></script>
+</body>
+</html>
