@@ -49,9 +49,3 @@ Developer -> GitHub -> Terraform creates EC2 -> Ansible installs Docker
 | Member (expired plan) | `expired@member.com` | `Member@123` |
 
 Change these before using the project for anything real.
-
-## Documentation
-
-- [HOW_TO_RUN.md](HOW_TO_RUN.md) — run locally and deploy to AWS
-- [ARCHITECTURE.md](ARCHITECTURE.md) — diagrams: pipeline, containers, database, flows
-- [DEMO_WALKTHROUGH.md](DEMO_WALKTHROUGH.md) — a script for presenting the project
