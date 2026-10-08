@@ -1,39 +1,181 @@
 ---
-- name: Deploy Gym Membership Portal to the EC2 instance
+# Deploys (or updates) the Gym Portal on the EC2 server. Safe to run repeatedly.
+#
+# By hand (from WSL):
+#   ansible-playbook -i inventory.ini deploy.yml -e @secrets.yml                         # build on the server
+#   ansible-playbook -i inventory.ini deploy.yml -e @secrets.yml -e image_tag=<commit>   # run tested images
+#   ... -e reset_database=true     wipes the database volume and reseeds the demo data (destructive!)
+#   ... -e repo_version=fa1-fallback -e image_tag=   redeploys the old FA1 version
+# The CI/CD pipeline runs it with the same variables, taken from GitHub Secrets.
+- name: Deploy the Gym Membership Portal to the EC2 instance
   hosts: web
   become: true
 
   vars:
     repo_url: "https://github.com/AyanMujawar/gym-membership-management-portal.git"
+    repo_version: main                    # a branch, tag or commit: where the compose file and configs come from
     app_dir: /home/ubuntu/gym-membership-management-portal
+    image_registry: ghcr.io/ayanmujawar   # where CI publishes the tested images
+    image_tag: ""                         # empty = build the images on the server instead of pulling
+    reset_database: false
+    swap_size: 1G
+
+  pre_tasks:
+    - name: Check that the secrets were supplied (db_password, secret_key, grafana_admin_password)
+      ansible.builtin.assert:
+        that:
+          - db_password is defined and db_password | length > 0
+          - secret_key is defined and secret_key | length >= 32
+          - grafana_admin_password is defined and grafana_admin_password | length > 0
+        fail_msg: "Pass the secrets with -e @secrets.yml (see secrets.example.yml). Never commit that file."
+      no_log: true
 
   tasks:
-    - name: Update apt package cache
-      apt:
-        update_cache: yes
-
-    - name: Install Docker, the Compose plugin, and git
-      apt:
+    # ---------- the machine itself ----------
+    - name: Install Docker, the Compose plugin, git and disk tools
+      ansible.builtin.apt:
         name:
           - docker.io
           - docker-compose-v2
           - git
+          - acl                 # lets Ansible run tasks as the ubuntu user
+          - cloud-guest-utils   # growpart
         state: present
+        update_cache: true
+        cache_valid_time: 3600
 
     - name: Add the ubuntu user to the docker group
-      user:
+      ansible.builtin.user:
         name: ubuntu
         groups: docker
-        append: yes
+        append: true
 
-    - name: Clone (or update) the project repository from GitHub
-      git:
+    - name: Grow the root partition to the size of the (enlarged) disk
+      ansible.builtin.command: growpart /dev/nvme0n1 1
+      register: growpart
+      changed_when: "'CHANGED' in growpart.stdout"
+      failed_when: growpart.rc not in [0, 1]      # rc 1 = already as large as it can be
+      when: "'nvme0n1' in ansible_facts.devices"
+
+    - name: Grow the filesystem to fill the partition
+      ansible.builtin.command: resize2fs /dev/nvme0n1p1
+      register: resize
+      changed_when: "'Nothing to do' not in (resize.stdout + resize.stderr)"
+      when: "'nvme0n1' in ansible_facts.devices"
+
+    # A small server can run out of memory during image builds and pulls; swap is the safety net
+    - name: Check whether swap is already active
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swap_active
+      changed_when: false
+
+    - name: Create the swap file
+      ansible.builtin.command: "fallocate -l {{ swap_size }} /swapfile"
+      args:
+        creates: /swapfile
+
+    - name: Restrict the swap file to root
+      ansible.builtin.file:
+        path: /swapfile
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Format the swap file
+      ansible.builtin.command: mkswap /swapfile
+      when: "'/swapfile' not in swap_active.stdout"
+
+    - name: Turn swap on
+      ansible.builtin.command: swapon /swapfile
+      when: "'/swapfile' not in swap_active.stdout"
+
+    - name: Keep swap on after a reboot
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+        regexp: '^/swapfile\s'
+
+    # ---------- the application's configuration ----------
+    - name: Make sure the app directory belongs to the ubuntu user
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        recurse: true
+
+    - name: Fetch the project at the requested version (compose file, monitoring configs, schema)
+      ansible.builtin.git:
         repo: "{{ repo_url }}"
         dest: "{{ app_dir }}"
-        version: main
-        force: yes
+        version: "{{ repo_version }}"
+        force: true
+      become_user: ubuntu
 
-    - name: Build and start all containers with Docker Compose
-      command: docker compose up --build -d
+    - name: Write the environment file (secrets and the image tags to run)
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+        content: |
+          APP_ENV=production
+          DB_PASSWORD={{ db_password }}
+          SECRET_KEY={{ secret_key }}
+          GRAFANA_ADMIN_PASSWORD={{ grafana_admin_password }}
+          IMAGE_TAG={{ image_tag }}
+          {% if image_tag | length > 0 %}
+          BACKEND_IMAGE={{ image_registry }}/gym-portal-backend:{{ image_tag }}
+          FRONTEND_IMAGE={{ image_registry }}/gym-portal-frontend:{{ image_tag }}
+          {% endif %}
+      no_log: true
+
+    # ---------- containers ----------
+    - name: Log in to the container registry (only needed to pull private images)
+      ansible.builtin.shell: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+      environment:
+        REGISTRY_USER: "{{ ghcr_user | default('') }}"
+        REGISTRY_TOKEN: "{{ ghcr_token | default('') }}"
+      when: image_tag | length > 0 and ghcr_token is defined and ghcr_token | length > 0
+      changed_when: false
+      no_log: true
+
+    - name: Remove the old containers AND the database volume (reset_database=true only)
+      ansible.builtin.command: docker compose down -v --remove-orphans
       args:
         chdir: "{{ app_dir }}"
+      when: reset_database | bool
+
+    - name: Pull the tested images
+      ansible.builtin.command: docker compose pull --quiet
+      args:
+        chdir: "{{ app_dir }}"
+      when: image_tag | length > 0
+      changed_when: false
+
+    - name: Start (or update) every container
+      ansible.builtin.command: "docker compose up -d --remove-orphans {{ '' if image_tag | length > 0 else '--build' }}"
+      args:
+        chdir: "{{ app_dir }}"
+      register: compose_up
+      changed_when: compose_up.stderr is search('(Created|Recreated|Started)')
+
+    - name: Wait until the API reports ready (database reachable) through nginx
+      ansible.builtin.uri:
+        url: http://127.0.0.1/api/health/ready
+        status_code: 200
+      register: ready
+      until: ready.status == 200
+      retries: 40
+      delay: 5
+
+    - name: Show the running containers
+      ansible.builtin.command: docker compose ps --format "table {{ '{{' }}.Service{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
+      args:
+        chdir: "{{ app_dir }}"
+      register: ps
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ ps.stdout_lines }}"

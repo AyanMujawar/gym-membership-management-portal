@@ -13,6 +13,13 @@ provider "aws" {
 
   # Terraform refuses to run if the credentials belong to any other AWS account
   allowed_account_ids = [var.aws_account_id]
+
+  # Every resource created here is labelled, so it is always clear what belongs to this project
+  default_tags {
+    tags = {
+      Project = "gym-portal"
+    }
+  }
 }
 
 # Automatically finds the latest Ubuntu 22.04 image in whichever region we deploy to,
@@ -34,9 +41,12 @@ resource "aws_key_pair" "deployer" {
   public_key = file(var.ssh_public_key_path)
 }
 
-# Opens the ports our app needs: 22 (SSH, for Ansible), 80 (frontend), 5000 (backend API)
+# The firewall. Only what people genuinely need is open: SSH (key-only, used by Ansible and CI),
+# the website, and Grafana. Prometheus, Alertmanager and the API itself are not reachable from outside:
+# nginx forwards /api internally, and the monitoring UIs are bound to the server's own loopback.
 resource "aws_security_group" "allow_web_ssh" {
-  name        = "gym-portal-allow-web-ssh"
+  name = "gym-portal-allow-web-ssh"
+  # AWS cannot change a security group's description in place (it would replace the group), so this wording is kept
   description = "Allow SSH, HTTP, and backend API traffic"
 
   ingress {
@@ -44,11 +54,11 @@ resource "aws_security_group" "allow_web_ssh" {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.ssh_allowed_cidr]
   }
 
   ingress {
-    description = "Frontend"
+    description = "Website (nginx)"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -56,11 +66,24 @@ resource "aws_security_group" "allow_web_ssh" {
   }
 
   ingress {
-    description = "Backend API"
-    from_port   = 5000
-    to_port     = 5000
+    description = "Grafana dashboards"
+    from_port   = 3000
+    to_port     = 3000
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Only needed by the old FA1 version, whose frontend called the API on port 5000 directly.
+  # Set open_legacy_api_port = false once the FA2 version is the only one in use.
+  dynamic "ingress" {
+    for_each = var.open_legacy_api_port ? [1] : []
+    content {
+      description = "Legacy backend API (FA1 fallback only)"
+      from_port   = 5000
+      to_port     = 5000
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
   }
 
   egress {
@@ -78,7 +101,29 @@ resource "aws_instance" "gym_portal_vm" {
   key_name               = aws_key_pair.deployer.key_name
   vpc_security_group_ids = [aws_security_group.allow_web_ssh.id]
 
+  # Room for the application images plus the monitoring stack and its data
+  root_block_device {
+    volume_size = var.root_volume_size
+    volume_type = "gp3"
+  }
+
+  # Require session tokens for the instance metadata service (blocks a class of credential-theft attacks)
+  metadata_options {
+    http_tokens = "required"
+  }
+
   tags = {
     Name = "gym-portal-vm"
+  }
+}
+
+# A fixed public address. Without it the IP changes whenever the server is stopped and started,
+# which would break the CI/CD pipeline's deploy target and the demo links.
+resource "aws_eip" "gym_portal_ip" {
+  domain   = "vpc"
+  instance = aws_instance.gym_portal_vm.id
+
+  tags = {
+    Name = "gym-portal-ip"
   }
 }

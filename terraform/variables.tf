@@ -27,3 +27,21 @@ variable "ssh_public_key_path" {
   type        = string
   default     = "~/.ssh/gym-portal-key.pub"
 }
+
+variable "root_volume_size" {
+  description = "Size in GB of the server's disk"
+  type        = number
+  default     = 20
+}
+
+variable "ssh_allowed_cidr" {
+  description = "Who may reach SSH. Open to all because the CI runners and the demo laptop have changing addresses; login is key-only"
+  type        = string
+  default     = "0.0.0.0/0"
+}
+
+variable "open_legacy_api_port" {
+  description = "Keep port 5000 open for the old FA1 version (set to false when only the FA2 version is deployed)"
+  type        = bool
+  default     = true
+}
