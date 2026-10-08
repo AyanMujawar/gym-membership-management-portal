@@ -1,0 +1,11 @@
+# Non-secret settings. Secrets (database password, token signing key) live in the "gym-secrets" Secret,
+# which scripts/k8s-deploy.sh generates at deploy time so no secret is ever stored in the repo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gym-config
+data:
+  APP_ENV: production
+  DB_HOST: mysql
+  DB_USER: root
+  DB_NAME: gym_portal
