@@ -8,7 +8,11 @@ terraform {
 }
 
 provider "aws" {
-  region = var.aws_region
+  region  = var.aws_region
+  profile = var.aws_profile
+
+  # Terraform refuses to run if the credentials belong to any other AWS account
+  allowed_account_ids = [var.aws_account_id]
 }
 
 # Automatically finds the latest Ubuntu 22.04 image in whichever region we deploy to,
