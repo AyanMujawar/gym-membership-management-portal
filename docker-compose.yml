@@ -1,35 +1,159 @@
+# The whole system: the app (db, backend, frontend) and its monitoring (Prometheus, Alertmanager,
+# node-exporter, Grafana, Loki, Promtail). Defaults below suit local development; on the server
+# Ansible writes a .env file with real secrets and the image tags to deploy.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: mysql:8.0
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-password}
       MYSQL_DATABASE: gym_portal
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./app/backend/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      # Runs once, on the very first start of an empty volume, and seeds the demo data
+      - ./app/backend/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      # Over TCP on purpose: MySQL's temporary init server has networking off, so this only
+      # succeeds once the database is fully initialised and seeded
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    logging: *default-logging
 
   backend:
+    image: ${BACKEND_IMAGE:-gym-portal-backend:local}
     build: ./app/backend
     restart: unless-stopped
     environment:
       DB_HOST: db
       DB_USER: root
-      DB_PASSWORD: password
+      DB_PASSWORD: ${DB_PASSWORD:-password}
       DB_NAME: gym_portal
-      SECRET_KEY: change-this-secret-key
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      APP_ENV: ${APP_ENV:-development}
     depends_on:
-      - db
-    ports:
-      - "5000:5000"
+      db:
+        condition: service_healthy
+    expose:
+      - "5000"          # internal only; the public entry point is the frontend's /api proxy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
 
   frontend:
+    image: ${FRONTEND_IMAGE:-gym-portal-frontend:local}
     build: ./app/frontend
     restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
-      - "80:80"
+      - "80:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  # ---------- monitoring ----------
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"     # reachable from the machine itself only (use an SSH tunnel on the server)
+    mem_limit: 300m
+    logging: *default-logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    mem_limit: 100m
+    logging: *default-logging
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro
+    mem_limit: 64m
+    logging: *default-logging
+
+  loki:
+    image: grafana/loki:3.1.1
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./monitoring/loki:/etc/loki:ro
+      - loki_data:/loki
+    mem_limit: 300m
+    logging: *default-logging
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./monitoring/promtail:/etc/promtail:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    mem_limit: 128m
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+    ports:
+      - "3000:3000"
+    mem_limit: 300m
+    logging: *default-logging
 
 volumes:
   mysql_data:
+  prometheus_data:
+  alertmanager_data:
+  loki_data:
+  grafana_data:

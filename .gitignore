@@ -10,3 +10,11 @@ uploads/
 .env
 docker_up.log
 .claude/
+
+# FA2
+ansible/secrets.yml
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.tfplan

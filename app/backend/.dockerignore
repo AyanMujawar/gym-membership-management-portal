@@ -1,0 +1,13 @@
+tests/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.coveragerc
+.flake8
+pytest.ini
+requirements-dev.txt
+schema.sql
+Dockerfile
+.dockerignore
