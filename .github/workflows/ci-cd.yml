@@ -1,0 +1,278 @@
+# The whole delivery pipeline as code:
+#
+#   push / pull request --> test --+
+#                          iac  ---+--> build + scan --> compose test --+--> publish --> deploy --> smoke test
+#                                                        kubernetes test +   (main & fa2)  (main only)  (rolls back on failure)
+#
+# Nothing reaches the server unless every earlier job passed, and the image that is deployed is the very
+# one that was tested (built once, tagged with the commit SHA).
+name: CI/CD
+
+on:
+  push:
+    branches: [main, fa2-cicd-monitoring]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push cancels a superseded run on a branch, but never interrupts a deploy running on main
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  IMAGE_PREFIX: ghcr.io/ayanmujawar/gym-portal   # container registry names must be lowercase
+
+jobs:
+  # ------------------------------------------------------------------ CI: fast feedback on the code
+  test:
+    name: Lint, security scans, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: app/backend/requirements*.txt
+      - name: Install dependencies
+        run: pip install -r app/backend/requirements-dev.txt pip-audit
+      - name: Lint (flake8)
+        working-directory: app/backend
+        run: flake8 .
+      - name: Static security analysis (Bandit)
+        working-directory: app/backend
+        run: bandit -r app.py db.py observability.py -ll
+      - name: Dependency vulnerability scan (pip-audit)
+        run: pip-audit -r app/backend/requirements.txt
+      - name: Unit tests (coverage must stay at or above 85%)
+        working-directory: app/backend
+        run: pytest --cov --cov-fail-under=85
+
+  iac:
+    name: Infrastructure and config checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - name: Terraform format and validate
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+      - name: Ansible playbook syntax
+        run: |
+          pip install ansible-core
+          printf '[web]\n127.0.0.1\n' > /tmp/inventory.ini
+          ansible-playbook -i /tmp/inventory.ini ansible/deploy.yml --syntax-check \
+            -e db_password=x -e secret_key=0123456789012345678901234567890123 -e grafana_admin_password=x
+      - name: Docker Compose file
+        run: docker compose config -q
+      - name: Kubernetes manifests render
+        run: kubectl kustomize k8s > /dev/null
+      - name: Prometheus config and alert rules
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v2.54.1 check config /etc/prometheus/prometheus.yml
+
+  # ------------------------------------------------------------------ build once, scan, hand on
+  build:
+    name: Build and scan images
+    needs: [test, iac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: app/backend
+          load: true
+          tags: gym-portal-backend:ci
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+      - name: Build the frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: app/frontend
+          load: true
+          tags: gym-portal-frontend:ci
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+      - name: Scan the backend image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: gym-portal-backend:ci
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan the frontend image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: gym-portal-frontend:ci
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Save the tested images for the next jobs
+        run: docker save gym-portal-backend:ci gym-portal-frontend:ci -o images.tar
+      - uses: actions/upload-artifact@v7
+        with:
+          name: images
+          path: images.tar
+          retention-days: 1
+
+  # ------------------------------------------------------------------ prove the images work, twice
+  compose-test:
+    name: Integration test (Docker Compose)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: images
+      - run: docker load -i images.tar
+      - name: Start the application stack
+        env:
+          BACKEND_IMAGE: gym-portal-backend:ci
+          FRONTEND_IMAGE: gym-portal-frontend:ci
+        run: docker compose up -d --no-build --wait db backend frontend
+      - name: Smoke test (a whole member journey)
+        run: python scripts/smoke_test.py http://localhost --wait 60
+      - name: Show the logs if anything failed
+        if: failure()
+        run: docker compose logs --tail 80
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  kubernetes-test:
+    name: Integration test (Kubernetes)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: images
+      - run: docker load -i images.tar
+      - name: Create a temporary Kubernetes cluster (kind)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: gym-test
+      - name: Load the tested images into the cluster
+        run: kind load docker-image gym-portal-backend:ci gym-portal-frontend:ci --name gym-test
+      - name: Deploy the manifests
+        env:
+          BACKEND_IMAGE: gym-portal-backend:ci
+          FRONTEND_IMAGE: gym-portal-frontend:ci
+        run: scripts/k8s-deploy.sh
+      - name: Smoke test through the cluster
+        run: |
+          kubectl -n gym-portal port-forward svc/frontend 8081:80 &
+          python scripts/smoke_test.py http://localhost:8081 --wait 90
+      - name: Show cluster state if anything failed
+        if: failure()
+        run: |
+          kubectl -n gym-portal get pods -o wide
+          kubectl -n gym-portal describe pods | tail -80
+          kubectl -n gym-portal logs -l app=backend --tail 60 || true
+
+  # ------------------------------------------------------------------ release
+  publish:
+    name: Publish images to the registry
+    needs: [compose-test, kubernetes-test]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fa2-cicd-monitoring')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: images
+      - run: docker load -i images.tar
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag with the commit SHA and push
+        run: |
+          for service in backend frontend; do
+            docker tag "gym-portal-${service}:ci" "${IMAGE_PREFIX}-${service}:${GITHUB_SHA}"
+            docker tag "gym-portal-${service}:ci" "${IMAGE_PREFIX}-${service}:latest"
+            docker push "${IMAGE_PREFIX}-${service}:${GITHUB_SHA}"
+            docker push "${IMAGE_PREFIX}-${service}:latest"
+          done
+
+  deploy:
+    name: Deploy to AWS
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production        # approvals can be required here (repository Settings > Environments)
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Ansible
+        run: pip install ansible-core
+      - name: Prepare SSH access and the inventory
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/deploy_key"
+          printf '[web]\n%s ansible_user=ubuntu ansible_ssh_private_key_file=%s/deploy_key ansible_ssh_common_args="-o StrictHostKeyChecking=no"\n' \
+            "$SERVER_IP" "$HOME" > "$HOME/inventory.ini"
+      - name: Remember which version is running now (for rollback)
+        id: previous
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          tag=$(ssh -i "$HOME/deploy_key" -o StrictHostKeyChecking=no -o ConnectTimeout=20 "ubuntu@${SERVER_IP}" \
+            "grep '^IMAGE_TAG=' gym-membership-management-portal/.env | cut -d= -f2" 2>/dev/null || true)
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Currently running: ${tag:-nothing recorded}"
+      - name: Deploy this commit with Ansible
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          APP_SECRET_KEY: ${{ secrets.APP_SECRET_KEY }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          umask 077
+          jq -n --arg db "$DB_PASSWORD" --arg key "$APP_SECRET_KEY" --arg graf "$GRAFANA_ADMIN_PASSWORD" \
+              --arg user "$GITHUB_ACTOR" --arg token "$REGISTRY_TOKEN" --arg sha "$GITHUB_SHA" \
+              '{db_password:$db, secret_key:$key, grafana_admin_password:$graf, ghcr_user:$user, ghcr_token:$token,
+                image_tag:$sha, repo_version:$sha}' > "$HOME/extra.json"
+          ANSIBLE_HOST_KEY_CHECKING=False ANSIBLE_PIPELINING=True \
+            ansible-playbook -i "$HOME/inventory.ini" ansible/deploy.yml -e "@$HOME/extra.json"
+      - name: Smoke test the live site
+        id: smoke
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: python scripts/smoke_test.py "http://${SERVER_IP}" --wait 120
+      - name: Roll back to the previous version if the live smoke test failed
+        if: failure() && steps.smoke.outcome == 'failure' && steps.previous.outputs.tag != ''
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          APP_SECRET_KEY: ${{ secrets.APP_SECRET_KEY }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          umask 077
+          jq -n --arg db "$DB_PASSWORD" --arg key "$APP_SECRET_KEY" --arg graf "$GRAFANA_ADMIN_PASSWORD" \
+              --arg user "$GITHUB_ACTOR" --arg token "$REGISTRY_TOKEN" --arg prev "$PREVIOUS_TAG" \
+              '{db_password:$db, secret_key:$key, grafana_admin_password:$graf, ghcr_user:$user, ghcr_token:$token,
+                image_tag:$prev, repo_version:$prev}' > "$HOME/rollback.json"
+          ANSIBLE_HOST_KEY_CHECKING=False ANSIBLE_PIPELINING=True \
+            ansible-playbook -i "$HOME/inventory.ini" ansible/deploy.yml -e "@$HOME/rollback.json"
+          echo "::warning::Deployment failed its smoke test and was rolled back to ${PREVIOUS_TAG}"
