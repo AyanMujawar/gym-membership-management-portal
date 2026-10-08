@@ -1,15 +1,23 @@
+import datetime
+import decimal
+import logging
+import os
+import uuid
+from functools import wraps
+
+import jwt
 from flask import Flask, jsonify, request
 from flask.json.provider import DefaultJSONProvider
 from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
 from mysql.connector import IntegrityError
-from db import get_db_connection, query, execute
-import jwt
-import datetime
-import decimal
-import uuid
-import os
+from werkzeug.exceptions import HTTPException
+from werkzeug.security import check_password_hash, generate_password_hash
+
+import observability
+from db import execute, query, transaction, update_row
+
+log = logging.getLogger("gym.app")
+
 
 # Makes dates come out as "2026-09-20" and money as plain numbers in the JSON responses
 class GymJSONProvider(DefaultJSONProvider):
@@ -21,12 +29,29 @@ class GymJSONProvider(DefaultJSONProvider):
             return float(o)
         return DefaultJSONProvider.default(o)
 
+
+DEFAULT_SECRET_KEYS = {"", "dev-secret-key-change-in-production", "change-this-secret-key", "changeme"}
+
+
+# Returns the key used to sign login tokens. In production a real random key is mandatory,
+# so the service refuses to start with a known default instead of running insecurely.
+def load_secret_key(env):
+    key = env.get("SECRET_KEY", "")
+    if env.get("APP_ENV") == "production":
+        if key in DEFAULT_SECRET_KEYS or len(key) < 32:
+            raise RuntimeError("SECRET_KEY must be a random value of at least 32 characters when APP_ENV=production")
+        return key
+    return key or "dev-secret-key-change-in-production"
+
+
 app = Flask(__name__)
 app.json = GymJSONProvider(app)
 CORS(app)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key-change-in-production")
+app.config["SECRET_KEY"] = load_secret_key(os.environ)
+observability.init_app(app)
 
 PAYMENT_METHODS = {"Card", "UPI", "NetBanking"}
+
 
 # Checks the Authorization header for a valid JWT with the required role ("member" or "admin")
 # before letting a route run. The route receives the decoded token as its first argument.
@@ -48,21 +73,25 @@ def auth_required(role):
         return decorated
     return wrapper
 
+
 def make_token(id_field, id_value, role):
     return jwt.encode({
         id_field: id_value,
         "role": role,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=6)
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)
     }, app.config["SECRET_KEY"], algorithm="HS256")
+
 
 # Returns the names of any required fields that are missing/blank in the request body
 def missing_fields(data, fields):
     return [f for f in fields if not str(data.get(f) or "").strip()]
 
+
 # Any Active membership whose end date has passed becomes Expired. Called before every
 # read that shows membership status, so statuses are always current without a background job.
 def expire_memberships():
     execute("UPDATE memberships SET status = 'Expired' WHERE status = 'Active' AND end_date < CURDATE()")
+
 
 # Members whose latest (Active, else most recently Expired) membership is shown next to their profile
 MEMBER_LIST_SQL = """
@@ -91,9 +120,42 @@ EXPIRED_SQL = """
     ORDER BY m.end_date DESC
 """
 
+
+# --- ERROR HANDLING ---
+
+# Every error leaves the API as JSON, so the frontend can always read the "error" field
+@app.errorhandler(HTTPException)
+def handle_http_error(error):
+    return jsonify({"error": error.description or error.name}), error.code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    log.error("unhandled exception", exc_info=error)
+    return jsonify({"error": "Internal server error"}), 500
+
+
+# --- HEALTH ---
+
+# Liveness: "is the process alive?" Never touches the database, so a database outage
+# cannot make an orchestrator kill a perfectly healthy API container.
 @app.route("/api/health", methods=["GET"])
-def health_check():
+@app.route("/api/health/live", methods=["GET"])
+def health_live():
     return jsonify({"status": "ok", "message": "Gym Membership Portal API is running"})
+
+
+# Readiness: "can it serve traffic?" Fails while the database is unreachable,
+# which tells a load balancer / Kubernetes to stop sending requests to this instance.
+@app.route("/api/health/ready", methods=["GET"])
+def health_ready():
+    try:
+        query("SELECT 1 AS ok", one=True)
+    except Exception:
+        observability.log_event(log, logging.WARNING, "readiness check failed: database unreachable")
+        return jsonify({"status": "unavailable", "database": "down"}), 503
+    return jsonify({"status": "ok", "database": "up"})
+
 
 # --- MEMBER AUTH ---
 
@@ -116,15 +178,20 @@ def register_user():
         return jsonify({"error": "That email is already registered"}), 409
     return jsonify({"message": "Member registered", "user_id": new_user_id}), 201
 
+
 # Verifies email/password and returns a JWT token identifying this member
 @app.route("/api/users/login", methods=["POST"])
 def login_user():
     data = request.get_json(silent=True) or {}
     user = query("SELECT * FROM users WHERE email = %s", (data.get("email"),), one=True)
     if user and check_password_hash(user["password"], data.get("password") or ""):
+        observability.LOGINS.labels("member", "success").inc()
         return jsonify({"message": "Login successful", "name": user["name"],
                         "token": make_token("user_id", user["user_id"], "member")})
+    observability.LOGINS.labels("member", "failure").inc()
+    observability.log_event(log, logging.WARNING, "login failed", event="login_failed", role="member")
     return jsonify({"error": "Invalid email or password"}), 401
+
 
 # --- ADMIN AUTH ---
 
@@ -134,9 +201,13 @@ def login_admin():
     data = request.get_json(silent=True) or {}
     admin = query("SELECT * FROM admins WHERE email = %s", (data.get("email"),), one=True)
     if admin and check_password_hash(admin["password"], data.get("password") or ""):
+        observability.LOGINS.labels("admin", "success").inc()
         return jsonify({"message": "Login successful", "name": admin["name"],
                         "token": make_token("admin_id", admin["admin_id"], "admin")})
+    observability.LOGINS.labels("admin", "failure").inc()
+    observability.log_event(log, logging.WARNING, "login failed", event="login_failed", role="admin")
     return jsonify({"error": "Invalid email or password"}), 401
+
 
 # --- PLANS (public) ---
 
@@ -144,6 +215,7 @@ def login_admin():
 @app.route("/api/plans", methods=["GET"])
 def get_plans():
     return jsonify(query("SELECT * FROM membership_plans WHERE is_active = TRUE ORDER BY price"))
+
 
 # --- MEMBER: PROFILE ---
 
@@ -154,6 +226,7 @@ def get_profile(payload):
     user = query("SELECT user_id, name, email, phone, address, created_at FROM users WHERE user_id = %s",
                  (payload["user_id"],), one=True)
     return jsonify(user)
+
 
 # Updates name/phone/address, and optionally the password (current password required)
 @app.route("/api/me", methods=["PUT"])
@@ -174,9 +247,9 @@ def update_profile(payload):
 
     if not updates:
         return jsonify({"error": "No fields to update"}), 400
-    set_clause = ", ".join(f"{field} = %s" for field in updates)
-    execute(f"UPDATE users SET {set_clause} WHERE user_id = %s", (*updates.values(), payload["user_id"]))
+    update_row("users", "user_id", payload["user_id"], updates)
     return jsonify({"message": "Profile updated"})
+
 
 # --- MEMBER: MEMBERSHIP & PAYMENTS ---
 
@@ -200,6 +273,7 @@ def get_my_membership(payload):
     latest_expired = next((m for m in history if m["status"] == "Expired"), None)
     return jsonify({"active": active, "pending": pending, "latest_expired": latest_expired, "history": history})
 
+
 # Buys or renews a plan. The (simulated) payment is recorded straight away and the
 # membership waits as Pending until an admin approves it.
 @app.route("/api/memberships", methods=["POST"])
@@ -218,23 +292,20 @@ def subscribe(payload):
         return jsonify({"error": "You already have a request waiting for admin approval"}), 400
 
     # Membership + payment are saved together so one can never exist without the other
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
+    txn_ref = "TXN" + uuid.uuid4().hex[:10].upper()
+    with transaction() as cursor:
         cursor.execute("INSERT INTO memberships (user_id, plan_id) VALUES (%s, %s)",
                        (payload["user_id"], plan["plan_id"]))
         membership_id = cursor.lastrowid
-        txn_ref = "TXN" + uuid.uuid4().hex[:10].upper()
         cursor.execute(
             "INSERT INTO payments (membership_id, user_id, amount, method, txn_ref) VALUES (%s, %s, %s, %s, %s)",
             (membership_id, payload["user_id"], plan["price"], data["method"], txn_ref)
         )
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
+    observability.MEMBERSHIPS_REQUESTED.inc()
+    observability.PAYMENTS.labels(data["method"]).inc()
     return jsonify({"message": "Payment successful. Waiting for admin approval.",
                     "membership_id": membership_id, "txn_ref": txn_ref}), 201
+
 
 # Lists the member's own payments
 @app.route("/api/me/payments", methods=["GET"])
@@ -249,6 +320,7 @@ def get_my_payments(payload):
         WHERE pay.user_id = %s
         ORDER BY pay.payment_id DESC
     """, (payload["user_id"],)))
+
 
 # --- ADMIN: DASHBOARD & REPORT ---
 
@@ -267,10 +339,12 @@ def summary_stats():
         """, one=True)["total"],
     }
 
+
 @app.route("/api/admin/dashboard", methods=["GET"])
 @auth_required("admin")
 def admin_dashboard(payload):
     return jsonify(summary_stats())
+
 
 # One-page report: summary, revenue by month, plan popularity, expiring soon, member list
 @app.route("/api/admin/report", methods=["GET"])
@@ -308,6 +382,7 @@ def admin_report(payload):
         "members": query(MEMBER_LIST_SQL + " ORDER BY u.name"),
     })
 
+
 # --- ADMIN: MEMBERS (CRUD) ---
 
 # Lists members with their current membership status; optional ?search= matches name/email
@@ -318,8 +393,10 @@ def admin_get_members(payload):
     search = request.args.get("search", "").strip()
     if search:
         like = f"%{search}%"
-        return jsonify(query(MEMBER_LIST_SQL + " WHERE u.name LIKE %s OR u.email LIKE %s ORDER BY u.name", (like, like)))
+        return jsonify(query(MEMBER_LIST_SQL + " WHERE u.name LIKE %s OR u.email LIKE %s ORDER BY u.name",
+                             (like, like)))
     return jsonify(query(MEMBER_LIST_SQL + " ORDER BY u.name"))
+
 
 @app.route("/api/admin/members", methods=["POST"])
 @auth_required("admin")
@@ -340,6 +417,7 @@ def admin_add_member(payload):
         return jsonify({"error": "That email is already registered"}), 409
     return jsonify({"message": "Member added", "user_id": new_id}), 201
 
+
 @app.route("/api/admin/members/<int:user_id>", methods=["PUT"])
 @auth_required("admin")
 def admin_update_member(payload, user_id):
@@ -353,12 +431,12 @@ def admin_update_member(payload, user_id):
         updates["password"] = generate_password_hash(data["password"])
     if not updates:
         return jsonify({"error": "No fields to update"}), 400
-    set_clause = ", ".join(f"{field} = %s" for field in updates)
     try:
-        execute(f"UPDATE users SET {set_clause} WHERE user_id = %s", (*updates.values(), user_id))
+        update_row("users", "user_id", user_id, updates)
     except IntegrityError:
         return jsonify({"error": "That email is already registered"}), 409
     return jsonify({"message": "Member updated"})
+
 
 # Deletes a member together with their payments and memberships
 @app.route("/api/admin/members/<int:user_id>", methods=["DELETE"])
@@ -366,17 +444,12 @@ def admin_update_member(payload, user_id):
 def admin_delete_member(payload, user_id):
     if query("SELECT user_id FROM users WHERE user_id = %s", (user_id,), one=True) is None:
         return jsonify({"error": "Member not found"}), 404
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
+    with transaction() as cursor:
         cursor.execute("DELETE FROM payments WHERE user_id = %s", (user_id,))
         cursor.execute("DELETE FROM memberships WHERE user_id = %s", (user_id,))
         cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
     return jsonify({"message": "Member deleted"})
+
 
 # --- ADMIN: MEMBERSHIPS (approval) ---
 
@@ -397,6 +470,7 @@ def admin_get_memberships(payload):
         return jsonify(query(sql + " WHERE m.status = %s ORDER BY m.membership_id DESC", (status,)))
     return jsonify(query(sql + " ORDER BY m.membership_id DESC"))
 
+
 # Approves (starts the membership) or rejects (refunds the payment) a Pending membership
 @app.route("/api/admin/memberships/<int:membership_id>", methods=["PUT"])
 @auth_required("admin")
@@ -415,28 +489,24 @@ def admin_decide_membership(payload, membership_id):
     if membership["status"] != "Pending":
         return jsonify({"error": "Only pending memberships can be approved or rejected"}), 400
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        if decision == "Approved":
-            # A renewal starts the day after the member's current membership ends, so no paid days are lost
-            start = datetime.date.today()
-            cursor.execute("SELECT MAX(end_date) FROM memberships WHERE user_id = %s AND status = 'Active'",
-                           (membership["user_id"],))
-            current_end = cursor.fetchone()[0]
-            if current_end and current_end >= start:
-                start = current_end + datetime.timedelta(days=1)
-            end = start + datetime.timedelta(days=membership["duration_days"])
-            cursor.execute("UPDATE memberships SET status = 'Active', start_date = %s, end_date = %s WHERE membership_id = %s",
-                           (start, end, membership_id))
-        else:
+    if decision == "Approved":
+        # A renewal starts the day after the member's current membership ends, so no paid days are lost
+        start = datetime.date.today()
+        current = query("SELECT MAX(end_date) AS current_end FROM memberships WHERE user_id = %s AND status = 'Active'",
+                        (membership["user_id"],), one=True)
+        current_end = current["current_end"] if current else None
+        if current_end and current_end >= start:
+            start = current_end + datetime.timedelta(days=1)
+        end = start + datetime.timedelta(days=membership["duration_days"])
+        execute("UPDATE memberships SET status = 'Active', start_date = %s, end_date = %s WHERE membership_id = %s",
+                (start, end, membership_id))
+    else:
+        with transaction() as cursor:
             cursor.execute("UPDATE memberships SET status = 'Rejected' WHERE membership_id = %s", (membership_id,))
             cursor.execute("UPDATE payments SET status = 'Refunded' WHERE membership_id = %s", (membership_id,))
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
+    observability.DECISIONS.labels(decision.lower()).inc()
     return jsonify({"message": f"Membership {decision.lower()}"})
+
 
 @app.route("/api/admin/expired", methods=["GET"])
 @auth_required("admin")
@@ -444,12 +514,14 @@ def admin_get_expired(payload):
     expire_memberships()
     return jsonify(query(EXPIRED_SQL))
 
+
 # --- ADMIN: PLANS (CRUD) ---
 
 @app.route("/api/admin/plans", methods=["GET"])
 @auth_required("admin")
 def admin_get_plans(payload):
     return jsonify(query("SELECT * FROM membership_plans ORDER BY price"))
+
 
 def validate_plan(data, partial=False):
     if not partial:
@@ -465,6 +537,7 @@ def validate_plan(data, partial=False):
         return "Duration and price must be numbers"
     return None
 
+
 @app.route("/api/admin/plans", methods=["POST"])
 @auth_required("admin")
 def admin_add_plan(payload):
@@ -478,6 +551,7 @@ def admin_add_plan(payload):
     )
     return jsonify({"message": "Plan added", "plan_id": new_id}), 201
 
+
 @app.route("/api/admin/plans/<int:plan_id>", methods=["PUT"])
 @auth_required("admin")
 def admin_update_plan(payload, plan_id):
@@ -490,9 +564,9 @@ def admin_update_plan(payload, plan_id):
     updates = {f: data[f] for f in ["name", "duration_days", "price", "description", "is_active"] if f in data}
     if not updates:
         return jsonify({"error": "No fields to update"}), 400
-    set_clause = ", ".join(f"{field} = %s" for field in updates)
-    execute(f"UPDATE membership_plans SET {set_clause} WHERE plan_id = %s", (*updates.values(), plan_id))
+    update_row("membership_plans", "plan_id", plan_id, updates)
     return jsonify({"message": "Plan updated"})
+
 
 # A plan that memberships already reference can't be deleted (that would erase history) — deactivate it instead
 @app.route("/api/admin/plans/<int:plan_id>", methods=["DELETE"])
@@ -505,5 +579,8 @@ def admin_delete_plan(payload, plan_id):
     execute("DELETE FROM membership_plans WHERE plan_id = %s", (plan_id,))
     return jsonify({"message": "Plan deleted"})
 
+
+# Local development only; containers run the app with gunicorn. Binding all interfaces is intended:
+# inside a container the published port is only reachable through Docker anyway.
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=os.environ.get("FLASK_DEBUG") == "1")  # nosec B104
