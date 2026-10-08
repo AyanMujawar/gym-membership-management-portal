@@ -41,7 +41,7 @@ variable "ssh_allowed_cidr" {
 }
 
 variable "open_legacy_api_port" {
-  description = "Keep port 5000 open for the old FA1 version (set to false when only the FA2 version is deployed)"
+  description = "Open port 5000 for the old FA1 version, which called the API directly. Off: the FA2 version only needs ports 22, 80 and 3000"
   type        = bool
-  default     = true
+  default     = false
 }

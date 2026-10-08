@@ -5,7 +5,8 @@
 #   ansible-playbook -i inventory.ini deploy.yml -e @secrets.yml                         # build on the server
 #   ansible-playbook -i inventory.ini deploy.yml -e @secrets.yml -e image_tag=<commit>   # run tested images
 #   ... -e reset_database=true     wipes the database volume and reseeds the demo data (destructive!)
-#   ... -e repo_version=fa1-fallback -e image_tag=   redeploys the old FA1 version
+#   ... -e repo_version=fa1-fallback -e image_tag=   redeploys the old FA1 version (also needs
+#       open_legacy_api_port=true in terraform, because FA1 calls the API on port 5000)
 # The CI/CD pipeline runs it with the same variables, taken from GitHub Secrets.
 - name: Deploy the Gym Membership Portal to the EC2 instance
   hosts: web
@@ -111,6 +112,7 @@
         version: "{{ repo_version }}"
         force: true
       become_user: ubuntu
+      register: checkout
 
     - name: Write the environment file (secrets and the image tags to run)
       ansible.builtin.copy:
@@ -159,6 +161,15 @@
         chdir: "{{ app_dir }}"
       register: compose_up
       changed_when: compose_up.stderr is search('(Created|Recreated|Started)')
+
+    # Prometheus, Alertmanager, Loki and Promtail only read their config files at start-up
+    # (Grafana re-reads its dashboards by itself), so restart them whenever a new version was fetched
+    - name: Restart the monitoring services so they pick up changed configuration
+      ansible.builtin.command: docker compose restart prometheus alertmanager loki promtail
+      args:
+        chdir: "{{ app_dir }}"
+      when: checkout.changed
+      changed_when: true
 
     - name: Wait until the API reports ready (database reachable) through nginx
       ansible.builtin.uri:

@@ -1,5 +1,6 @@
 groups:
-  # The SLIs behind our SLOs (see docs/slo.md), precomputed so dashboards and alerts agree
+  # The SLIs behind our SLOs (99.5% availability and success rate, 95% of requests under 500 ms),
+  # precomputed so dashboards and alerts agree
   - name: gym-portal-sli
     rules:
       - record: gym:http_error_ratio:rate5m
@@ -17,7 +18,6 @@ groups:
         annotations:
           summary: "Gym API is down"
           description: "Prometheus cannot scrape the backend: it has been unreachable for over a minute."
-          runbook: "docs/runbook.md#servicedown"
 
       - alert: HighErrorRate
         expr: gym:http_error_ratio:rate5m > 0.05
@@ -27,7 +27,6 @@ groups:
         annotations:
           summary: "More than 5% of requests are failing"
           description: "{{ $value | humanizePercentage }} of requests returned a 5xx over the last 5 minutes."
-          runbook: "docs/runbook.md#higherrorrate"
 
       - alert: HighLatency
         expr: gym:http_latency_p95:rate5m > 0.5
@@ -37,7 +36,6 @@ groups:
         annotations:
           summary: "95th percentile latency is above 500 ms"
           description: "p95 request latency is {{ $value | humanizeDuration }} (SLO: under 500 ms)."
-          runbook: "docs/runbook.md#highlatency"
 
       - alert: LoginFailureSpike
         expr: sum(increase(gym_logins_total{result="failure"}[5m])) > 20
@@ -47,7 +45,6 @@ groups:
         annotations:
           summary: "Unusually many failed logins"
           description: "{{ $value | printf \"%.0f\" }} failed logins in 5 minutes: possible password guessing."
-          runbook: "docs/runbook.md#loginfailurespike"
 
       - alert: HighMemoryUsage
         expr: 1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.85
@@ -57,4 +54,3 @@ groups:
         annotations:
           summary: "Server memory above 85%"
           description: "Memory use is {{ $value | humanizePercentage }}. On the old 1 GB server this preceded a crash."
-          runbook: "docs/runbook.md#highmemoryusage"

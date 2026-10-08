@@ -42,7 +42,7 @@ Developer --git push--> GitHub --> GitHub Actions
 | Configuration management | Ansible: swap, secrets, pull images, health-checked deploy | `ansible/deploy.yml` |
 | Registry | GitHub Container Registry, images tagged by commit SHA | |
 | Monitoring and logs | Prometheus, Alertmanager, node-exporter, Grafana (dashboards as code), Loki + Promtail | `monitoring/` |
-| SRE | SLOs and error budget, runbook, blameless post-mortem | `docs/` |
+| SRE | SLOs and error budget, alert rules, incident runbook, blameless post-mortem | `monitoring/` |
 
 ## Architecture
 
@@ -95,8 +95,12 @@ Change these before using the project for anything real.
 
 Passwords hashed (scrypt); JWT login tokens with a role check on every route; members only ever see their own data (identity comes from the token); parameterised SQL everywhere; HTML escaped in the frontend; non-root containers; the service refuses to start in production with a default signing key; secrets come from GitHub Secrets and are written to a private `.env` by Ansible, never committed; dependency, code and image scanning in CI; IMDSv2 required on the server; least-exposure firewall.
 
-## More documentation
+## Reliability targets (SLOs)
 
-- [docs/slo.md](docs/slo.md): service level objectives and the error budget
-- [docs/runbook.md](docs/runbook.md): what to do for each alert, and how to roll back
-- [docs/postmortem-2026-09-21-deploy-hang.md](docs/postmortem-2026-09-21-deploy-hang.md): a real incident and what changed because of it
+| Objective | Target | Alert that protects it |
+|---|---|---|
+| Availability (API reachable) | 99.5% per 30 days (error budget about 3.6 hours) | `ServiceDown` |
+| Success rate (no 5xx) | 99.5% | `HighErrorRate` |
+| Latency (answered in under 500 ms) | 95% | `HighLatency` |
+
+Two more alerts guard security and capacity: `LoginFailureSpike` and `HighMemoryUsage`. The dashboard's "Service level objectives" row shows all three objectives live.
